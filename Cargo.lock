@@ -3181,6 +3181,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.7",
+ "dashmap",
  "ever-node",
  "ever_block",
  "libc",
