@@ -56,6 +56,7 @@ pub enum Unit {
     Bytes,
     Cells,
     Accounts,
+    Blocks,
 }
 
 /// Counts what a step has done and shows it: the share done, the rate and the time left when the
@@ -167,12 +168,14 @@ impl Progress {
 
     /// An amount of what the step counts: "6.62 GB", "1,234,567", or "1,234,567 cells" with the noun.
     fn amount(&self, n: u64, noun: bool) -> String {
-        match (self.unit, noun) {
-            (Unit::Bytes, _) => bytes(n),
-            (Unit::Cells, true) => format!("{} cells", grouped(n)),
-            (Unit::Accounts, true) => format!("{} accounts", grouped(n)),
-            (_, false) => grouped(n),
-        }
+        let noun = match (self.unit, noun) {
+            (Unit::Bytes, _) => return bytes(n),
+            (_, false) => return grouped(n),
+            (Unit::Cells, true) => "cell",
+            (Unit::Accounts, true) => "account",
+            (Unit::Blocks, true) => "block",
+        };
+        format!("{} {noun}{}", grouped(n), if n == 1 { "" } else { "s" })
     }
 }
 
@@ -264,6 +267,8 @@ mod tests {
         let progress = Progress::new("counting", Unit::Accounts, None);
         assert_eq!(progress.status(5000, 2_000), "5,000 accounts, 2,500/s, 2 s so far");
         assert_eq!(progress.summary(5000, 2.0), "5,000 accounts in 2 s");
+        let progress = Progress::new("building", Unit::Blocks, Some(1));
+        assert_eq!(progress.summary(1, 0.2), "[####################] 100%  1 block in 0 s");
     }
 
     #[test]

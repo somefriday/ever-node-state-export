@@ -7,6 +7,7 @@
 
 mod boc;
 mod cells;
+mod chain;
 mod progress;
 mod rebuild;
 
@@ -333,27 +334,27 @@ struct Snapshot {
     shard_state: Arc<ShardStateStuff>,
 }
 
-fn load_snapshot(db: &InternalDb, mc_seqno: u32, refuse_key_block: bool) -> Result<Snapshot> {
-    let handle = db
-        .find_mc_block_by_seq_no(mc_seqno)
-        .with_context(|| format!("masterchain block {mc_seqno} is not in this database"))?;
-    let mc_id = handle.id().clone();
-    let key_block = handle.is_key_block()?;
+async fn load_snapshot(db: &InternalDb, mc_seqno: u32, refuse_key_block: bool) -> Result<Snapshot> {
+    let not_found = || format!("masterchain block {mc_seqno} is not in this database");
+    let mc_id = chain::find_mc_block(db, mc_seqno).with_context(not_found)?;
+    let key_block = db.load_block_handle(&mc_id)?.with_context(not_found)?.is_key_block()?;
     if key_block && refuse_key_block {
         bail!(
             "masterchain block {mc_seqno} is a key block. A snapshot of the key block that installs \
              a new validator set breaks DePool bookkeeping on Tycho; export a later block"
         );
     }
-    let mc_state = db.load_shard_state_dynamic(&mc_id).with_context(|| {
+    let mc_state = chain::load_state(db, &mc_id, &format!("masterchain block {mc_seqno}")).await.with_context(|| {
         format!(
-            "the state of masterchain block {mc_seqno} is not in this database: the node has deleted \
-             it already. `info` shows which blocks can be exported"
+            "the state of masterchain block {mc_seqno} is not in this database, and the tool can't build \
+             it from an earlier one: the node may have deleted it already. `info` shows which blocks \
+             can be exported"
         )
     })?;
 
     let shard_id = single_basechain_block(&mc_state.top_blocks_all()?, mc_seqno)?.clone();
-    let shard_state = db.load_shard_state_dynamic(&shard_id).with_context(|| {
+    let what = format!("basechain block {}", shard_id.seq_no());
+    let shard_state = chain::load_state(db, &shard_id, &what).await.with_context(|| {
         format!(
             "the state of basechain block {} (listed by masterchain block {mc_seqno}) is not in this \
              database: the node had not applied that basechain block yet when it stopped, or has \
@@ -392,7 +393,7 @@ async fn export(args: ExportArgs) -> Result<()> {
         .with_context(|| format!("cannot write to the output folder {} as {}", out.display(), me()))?;
     std::fs::remove_file(&probe)?;
 
-    let snapshot = load_snapshot(&db, args.mc_seqno, !args.allow_key_block)?;
+    let snapshot = load_snapshot(&db, args.mc_seqno, !args.allow_key_block).await?;
     let Snapshot { mc_id, key_block, mc_state, shard_id, shard_state } = snapshot;
     let threads = args.threads.map_or_else(default_threads, usize::from);
 
@@ -400,7 +401,7 @@ async fn export(args: ExportArgs) -> Result<()> {
     // export it is.
     let mc_base = persistent_base(&db, &mc_state, &mc_id).await?;
     let listed = match &mc_base {
-        Some(base) => listed_blocks(&db, base).await,
+        Some(base) => chain::listed_blocks(&db, base).await,
         None => Ok(Vec::new()),
     };
     let mut shard_bases = Vec::new();
@@ -526,12 +527,6 @@ async fn has_persistent_state(db: &InternalDb, id: &BlockIdExt) -> bool {
     saved && db.load_shard_state_persistent_size(id).await.is_ok()
 }
 
-/// The blocks a key block lists as the latest of each shard, read from the block itself.
-async fn listed_blocks(db: &InternalDb, id: &BlockIdExt) -> Result<Vec<BlockIdExt>> {
-    let handle = db.load_block_handle(id)?.context("the database has no record of it")?;
-    db.load_block_data(&handle).await?.top_blocks_all()
-}
-
 /// Which cells the export reads from the database when it starts from the persistent state of
 /// `base`, `blocks` blocks before the one exported: "in 41,207 blocks since key block 63075727".
 fn changed_since(base: &str, blocks: u32) -> String {
@@ -625,7 +620,7 @@ fn export_state(
 
 async fn verify(args: VerifyArgs) -> Result<()> {
     let (db, _marker, _) = open_database(&args.database).await?;
-    let snapshot = load_snapshot(&db, args.mc_seqno, false)?;
+    let snapshot = load_snapshot(&db, args.mc_seqno, false).await?;
     if snapshot.key_block {
         println!("note: masterchain block {} is a key block", args.mc_seqno);
     }
@@ -671,7 +666,8 @@ async fn info(args: InfoArgs) -> Result<()> {
         .load_full_node_state(LAST_APPLIED_MC_BLOCK)?
         .context("this database has no applied masterchain block")?;
     let last = db.load_block_handle(&last_id)?.context("cannot load the last applied block")?;
-    let range = exportable_blocks(&db, last_id.seq_no());
+    let range = exportable_blocks(&db, last_id.seq_no()).await;
+    let saved = chain::newest_saved_mc_state(&db).map(|id| id.seq_no());
     let basechain_done = db.load_full_node_state(SHARD_CLIENT_MC_BLOCK)?.map(|id| id.seq_no());
 
     println!("database folder: {}", folder.display());
@@ -686,6 +682,11 @@ async fn info(args: InfoArgs) -> Result<()> {
     if let Some(done) = basechain_done {
         println!("basechain blocks applied up to masterchain block {done}");
     }
+    // The node saves states in the background; those not saved when it stopped are built by the tool.
+    match saved {
+        Ok(saved) => println!("newest saved masterchain state: block {saved}"),
+        Err(error) => println!("newest saved masterchain state: none found ({error:#})"),
+    }
     match range {
         Some((oldest, newest)) => println!("blocks that can be exported: {oldest} to {newest}"),
         None => println!("blocks that can be exported: none"),
@@ -694,17 +695,17 @@ async fn info(args: InfoArgs) -> Result<()> {
 }
 
 /// A block can be exported when the node keeps both its own state and the state of the basechain
-/// block it lists. The node deletes old states, and a node that doesn't validate applies basechain
-/// blocks somewhat after masterchain blocks, so the range can end below the last applied block.
-fn exportable_blocks(db: &InternalDb, last: u32) -> Option<(u32, u32)> {
-    let exportable = |seqno: u32| load_snapshot(db, seqno, false).is_ok();
+/// block it lists, or can build them from states it saved before. The node deletes old states, and a
+/// node that doesn't validate applies basechain blocks somewhat after masterchain blocks, so the range
+/// can end below the last applied block.
+async fn exportable_blocks(db: &InternalDb, last: u32) -> Option<(u32, u32)> {
     // Newest: step down from the last applied block in doubling steps until a block is exportable,
     // then narrow down between it and the last block that wasn't.
     let (mut found, mut above) = (None, last + 1);
     let mut step = 1u32;
     let mut probe = Some(last);
     while let Some(seqno) = probe {
-        if exportable(seqno) {
+        if exportable(db, seqno).await {
             found = Some(seqno);
             break;
         }
@@ -715,15 +716,31 @@ fn exportable_blocks(db: &InternalDb, last: u32) -> Option<(u32, u32)> {
     let mut newest = found?;
     while newest + 1 < above {
         let middle = newest + (above - newest) / 2;
-        if exportable(middle) { newest = middle } else { above = middle }
+        if exportable(db, middle).await { newest = middle } else { above = middle }
     }
     // Oldest: below the newest, exportable blocks are contiguous down to the oldest kept state.
     let (mut low, mut high) = (0, newest);
     while low < high {
         let middle = low + (high - low) / 2;
-        if exportable(middle) { high = middle } else { low = middle + 1 }
+        if exportable(db, middle).await { high = middle } else { low = middle + 1 }
     }
     Some((high, newest))
+}
+
+/// Whether masterchain block `seqno` can be exported, checked without building any state.
+async fn exportable(db: &InternalDb, seqno: u32) -> bool {
+    let check = async {
+        let id = chain::find_mc_block(db, seqno)?;
+        // The shards a block lists are in its state, or else in the block itself.
+        let listed = match chain::saved_state_before(db, &id)? {
+            (state, blocks) if blocks.is_empty() => state.top_blocks_all()?,
+            _ => chain::listed_blocks(db, &id).await?,
+        };
+        let shard_id = single_basechain_block(&listed, seqno)?.clone();
+        chain::saved_state_before(db, &shard_id)?;
+        Ok::<_, anyhow::Error>(())
+    };
+    check.await.is_ok()
 }
 
 fn id_json(id: &BlockIdExt) -> serde_json::Value {

@@ -77,10 +77,17 @@ state-export info --evernode validator02
 state-export info --evernode validator02
 database folder: /var/lib/ever-validator/nodes/validator02/node_db
 database version: 6 (this build reads version 6)
-this build: 0.3.0 (ever-node 0.60.11, commit e4068621a96d78969dd6df3087504d25b06fca6e)
+this build: 0.3.1 (ever-node 0.60.11, commit e4068621a96d78969dd6df3087504d25b06fca6e)
 last applied masterchain block: 63402596 (time 1793648718)
 basechain blocks applied up to masterchain block 63402595
+newest saved masterchain state: block <S>
+blocks that can be exported: <oldest> to <newest>
 ```
+
+N must be within the range on the last line. The node saves block states in the background, so when
+it stops, the states of its last blocks may not be saved yet (`newest saved masterchain state` is
+then below the last applied block). The tool builds those states from the newest saved one and the
+blocks after it, as the node does when it starts again.
 
 ----
 
@@ -164,6 +171,6 @@ The output folder holds:
 |---|---|
 | `masterchain block N is a key block` | N is the block that switches validator sets, and a snapshot of it breaks DePool bookkeeping on Tycho. Check the number with the coordinator. |
 | `masterchain block N is not in this database` | The node stopped before block N. Use a node that got further. |
-| `the state of masterchain block N is not in this database` | The node has already deleted it. Use a node that stopped soon after block N; `info` shows which blocks a node can export. |
+| `the state of masterchain block N is not in this database, and the tool can't build it` | The node has already deleted it, or the data of a block between N and the newest saved state before it is missing or damaged (the cause follows the message). Use a node that stopped soon after block N; `info` shows which blocks a node can export. |
 | `the state of basechain block ... is not in this database` | The node stopped before it applied the basechain block that N points to, or has deleted it since. If `info` ends before N, start the node again while the network is still up, let it catch up, stop it and export again. Otherwise use a node that stopped soon after block N. |
 | `... lists N shard blocks` | The basechain was split into shards at block N. Tell the coordinator: the migration needs an unsplit basechain. |

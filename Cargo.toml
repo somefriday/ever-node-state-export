@@ -1,6 +1,6 @@
 [package]
 name = "state-export"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Export the ever-node states of a masterchain block as input for tycho-state-updater"
 publish = false
