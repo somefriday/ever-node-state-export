@@ -1,0 +1,24 @@
+[package]
+name = "state-export"
+version = "0.1.0"
+edition = "2021"
+description = "Export the ever-node states of a masterchain block as input for tycho-state-updater"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros"] }
+# ever-node uses OpenSSL; build it into the binary so it runs on any supported Ubuntu or Debian.
+openssl = { version = "0.10", features = ["vendored"] }
+
+# ever-node's database code reads the node's files, so it must be the version the node runs.
+# ever_block must be the version that ever-node uses. set-ever-node-rev.sh switches both to another
+# ever-node commit; the Dockerfile runs it for the EVER_NODE_REV build argument.
+ever_block = { git = "https://github.com/everx-labs/ever-block.git", tag = "1.11.20" }
+ever-node = { git = "https://github.com/everx-labs/ever-node.git", rev = "e4068621a96d78969dd6df3087504d25b06fca6e", default-features = false, features = ["telemetry"] }
+
+[profile.release]
+debug = false
