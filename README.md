@@ -4,6 +4,7 @@
 plus the state of the basechain block it points to. `tycho-state-updater` builds Tycho's starting
 state from these two files.
 
+
 ## Before you start
 
 - **The block number `N`.** The coordinator announces it.
@@ -18,7 +19,9 @@ state from these two files.
 The commands below are for root, as validator servers are usually run. As another user, put `sudo` in
 front of them, and of `docker` too unless you're in the `docker` group.
 
-## 1. Build the tool
+## Build the tool
+
+### Docker:
 
 ```sh
 git clone https://github.com/somefriday/ever-node-state-export.git
@@ -27,92 +30,83 @@ docker build --target binary --output . .
 install state-export /usr/local/bin/
 ```
 
-`state-export --version` shows the tool's version and the ever-node version it reads, for example
-`state-export 0.3.0 (ever-node 0.60.11, commit e4068621a96d78969dd6df3087504d25b06fca6e)`. The tool
-runs on Ubuntu 22.04 and 24.04 and on Debian 11, 12 and 13, on x86_64 and arm64.
-
-For route 3, build the image too (in the same folder):
-
-```sh
-docker build -t state-export .
-```
-
-### For another ever-node version
-
-The tool reads the node's database with ever-node's own code, so it must be built for your node's
-ever-node version. The default is ever-node 0.60.11 (commit `e4068621`). For another version, add
-`--build-arg EVER_NODE_REV=<commit>` to the `docker build` commands; `ever-node --version` shows your
-node's commit ("EVER NODE git commit"). If you're not sure, build the default: the tool refuses a
-database it can't read and says what to build.
-
-### Without Docker
-
-If the node's server has no Docker, build on another machine and copy the `state-export` file over.
-When the two machines have different architectures, add `--platform linux/amd64` or
-`--platform linux/arm64` to `docker build`.
-
-Or build on the server itself:
-
-```sh
-apt update
-apt install build-essential git curl pkg-config cmake clang libclang-dev libzstd-dev perl
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y     # skip if rustup is installed
-. "$HOME/.cargo/env"
-git clone https://github.com/somefriday/ever-node-state-export.git
-cd ever-node-state-export
-cargo build --release
-install target/release/state-export /usr/local/bin/
-```
 
 For another ever-node version, run `./set-ever-node-rev.sh <commit>` before `cargo build`.
 
-## 2. Export
+## State Export
 
-Follow the route that matches how you run your node.
+At this point you  need synced node that can be shut down. Use evernode_cli for create + dockerize one for simplicity.
 
-### Route 1: node managed by evernode_cli
+----
 
-Stop the node. At the cutover every validator is in the current validator set, and evernode_cli
-stops such a node only with `--force`:
+### 1. Stop node
 
+#### Native ever-node
+```sh
+systemctl stop <ever_node_service>
+```
+
+#### Dockerized node
+```sh
+docker stop --time 30 <container_name>
+```
+
+#### Evernode cli
 ```sh
 evernode node stop -n <name> --force
 ```
 
-Export:
+wait until node is fulli stopped.
 
+----
+
+### 2. Confirm the block you need is available
+
+#### For rocksdb folder path:
 ```sh
-state-export export --evernode <name> --mc-seqno <N> --out ./export
+state-export info --db <rocksdb_folder>
 ```
 
-The tool finds the node's database and checks that the node runs the ever-node commit the tool was
-built for. If evernode_cli keeps its data somewhere other than `/var/lib/ever-validator`, add
-`--evernode-state-dir <dir>`.
+#### For evernode cli provisioned node:
+```sh
+state-export info --evernode validator02
+```
 
-### Route 2: database folder on this machine
+#### Output example:
+```sh
+state-export info --evernode validator02
+database folder: /var/lib/ever-validator/nodes/validator02/node_db
+database version: 6 (this build reads version 6)
+this build: 0.3.0 (ever-node 0.60.11, commit e4068621a96d78969dd6df3087504d25b06fca6e)
+last applied masterchain block: 63402596 (time 1793648718)
+basechain blocks applied up to masterchain block 63402595
+```
 
-For a node running as a service, or any database folder you can reach. Stop the node however you
-run it.
+----
 
-The database folder is the one named by `internal_db_path` in the node's `config.json`. It contains
-`db/`, `archive/`, `catchains/` and a few others; give that folder, not the `db/` inside it.
+### 3. Export:
+
+### For rocksdb folder path:
 
 ```sh
 state-export export --db <rocksdb_folder> --mc-seqno <N> --out /tmp/export
 ```
+The database folder is the one named by `internal_db_path` in the node's `config.json`. It contains
+`db/`, `archive/`, `catchains/` and a few others; give that folder, not the `db/` inside it.
 
-The result goes to `/tmp/export` because the node's user can write there.
+### For evernode cli provisioned node:
+```sh
+state-export export --evernode <name> --mc-seqno <N> --out ./export
+```
+The tool finds the node's database and checks that the node runs the ever-node commit the tool was
+built for. If evernode_cli keeps its data somewhere other than `/var/lib/ever-validator`, add
+`--evernode-state-dir <dir>`.
 
-### Route 3: node in a Docker container
+
+### For node in docker:
 
 Stop the node container with `docker stop` (or `docker compose stop` in its compose folder). Don't
 use `docker compose down`: it removes the container, and the export needs it.
-
-```sh
-docker stop <container_name>
-```
-
-Export, with the image from step 1:
 
 ```sh
 docker run --rm --volumes-from <container_name> -v "$PWD/export:/out" \
@@ -122,37 +116,12 @@ docker run --rm --volumes-from <container_name> -v "$PWD/export:/out" \
 `--volumes-from` shows the tool the node container's files at the same paths, so give the database
 path as the container sees it (its `internal_db_path`).
 
-### While it runs
+The result goes to `/tmp/export` because the node's user can write there.
 
-The tool says what it's doing. Each step is numbered, so you can see how far through the export it
-is, and shows a progress bar with the time left, for example:
+----
 
-```
-masterchain block 63388016
-  [1/11] reading the persistent state of key block 63075727
-    [####################] 100%  6.70 GB in 16 s
-  [2/11] hashing its cells
-    [#########-----------]  45%  about 12 s left, 56,771,436 of 126,158,747 cells, 6,301,270/s
-```
 
-Reading the cells that changed from the database shows how many it has read so far: how many there
-are isn't known in advance. In a terminal the progress line is redrawn in place; when the output goes
-to a file or through `tee`, a new line is added every 10 seconds. The first line, `opening the
-database`, has no progress line.
-
-It starts from the newest persistent state the node keeps on disk: the node saves its whole state
-every 36 hours or so. The tool reads that file in one pass and takes from the database only the cells
-that changed since, so on mainnet the export takes minutes rather than hours. Each file is read back
-and checked against the block's state hash once it is written. A node that keeps no persistent
-states (`"skip_saving_persistent_states": true` in its config) makes the tool read every cell from
-the database instead, which takes hours on mainnet. `--threads` sets how many threads read cells
-from the database and hash them (the default is one per CPU, and at least 16).
-
-If you stop an export with Ctrl-C, the database folder keeps the file `ton_node.running`, which tells
-the node it crashed. If the node had stopped cleanly before the export (its log shows `Node stopped`
-when you stopped it), delete that file before you start the node.
-
-## 3. The result
+## The result
 
 The output folder holds:
 
@@ -160,16 +129,6 @@ The output folder holds:
 - `shardstate.boc`: the basechain state of the block N points to;
 - `manifest.json`: block ids and state hashes.
 
-## Which blocks can I export?
-
-Run `info` the same way as `export`, with the node stopped, but without `--mc-seqno` and `--out`.
-For route 2:
-
-```sh
-state-export info --db <rocksdb_folder>
-```
-
-It shows the database version, the node's last block and the range of blocks it can export.
 
 ## If something goes wrong
 
