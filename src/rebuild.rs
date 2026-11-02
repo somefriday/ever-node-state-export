@@ -1,277 +1,105 @@
-//! Builds a state in memory before it is written out. The cells the state shares with a persistent
-//! state come from that file, which is read in one pass; every other cell is read from the node's
-//! database, several at a time, and checked against its hash. Reading all of a mainnet state from
-//! the database cell by cell takes hours, as each cell is a random read.
+//! Rebuilds a state from the persistent states the node keeps on disk and the cells that changed
+//! since, which come from the node's database. Reading all of a mainnet state from the database cell
+//! by cell takes hours, as each cell is a random read; a persistent state file is read in one pass.
 
-use crate::progress::{Progress, Unit};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::{
+    boc::Refs,
+    cells::{Cells, DbCell, HashedBoc},
+    progress::Progress,
+};
+use anyhow::{anyhow, ensure, Result};
 use dashmap::DashMap;
-use ever_block::{
-    BocReader, BocWriter, Cell, DataCell, DoneCellsStorage, SimpleOrderedCellsStorage, UInt256,
-    MAX_SAFE_DEPTH,
-};
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
-        Arc,
-    },
-};
+use ever_block::{Cell, UInt256};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-/// The cells of a persistent state, by hash.
-pub type Known = HashMap<UInt256, Cell>;
-
-/// Subtrees per thread to share out once the top of the state is read.
-const TASKS_PER_THREAD: usize = 64;
-
-/// Builds the cells of a persistent state file in memory and indexes them by hash.
-pub fn parse_persistent(data: Vec<u8>) -> Result<(Cell, Known)> {
-    let total = boc_cells_count(&data);
-    let progress = Arc::new(Progress::new("building its cells", Unit::Cells, total));
-    let capacity = total.unwrap_or(0) as usize;
-    let cells = Rc::new(RefCell::new(Cells {
-        by_index: Vec::with_capacity(capacity),
-        by_hash: HashMap::with_capacity(capacity),
-        progress: progress.clone(),
-    }));
-    let root = BocReader::new()
-        .set_done_cells_storage(Box::new(SharedCells(cells.clone())))
-        .read_inmem(Arc::new(data))?
-        .withdraw_single_root()?;
-    progress.finish();
-    let cells = Rc::try_unwrap(cells).map_err(|_| anyhow!("the BOC reader kept the cells"))?;
-    Ok((root, cells.into_inner().by_hash))
+/// The cells of the state under `root`, and the number of its root: the cells of `bases` it shares
+/// and the others read from the database, `threads` at a time. `progress` counts the cells read.
+pub fn rebuild(root: &Cell, bases: Vec<HashedBoc>, threads: usize, progress: &Progress) -> Result<(Cells, u32)> {
+    let mut cells = Cells::new(bases);
+    let (id, read) = read_changed(root, &cells, threads, progress)?;
+    cells.add_read(read)?;
+    ensure!(*cells.hash(id) == *root.repr_hash().as_slice(), "the state was rebuilt wrong");
+    Ok((cells, id))
 }
 
-/// The number of cells a BOC holds, from its header: the magic, a flags byte that ends with the
-/// size of a cell reference, the size of an offset, then the cell count.
-fn boc_cells_count(data: &[u8]) -> Option<u64> {
-    if data.get(..4)? != [0xb5, 0xee, 0x9c, 0x72] {
-        return None;
+/// Cells of the database with the numbers they get.
+type Numbered<T> = Vec<(u32, T)>;
+
+/// Reads every cell under `root` that `cells` lacks, level by level, sharing out each level among
+/// `threads`. The cells read are numbered from `cells.len()` on in the order they are found. Returns
+/// the root's number and the cells read.
+fn read_changed(root: &Cell, cells: &Cells, threads: usize, progress: &Progress) -> Result<(u32, Vec<DbCell>)> {
+    if let Some(id) = cells.find(&root.repr_hash()) {
+        return Ok((id, Vec::new()));
     }
-    let ref_size = (*data.get(4)? & 0x07) as usize;
-    let count = data.get(6..6 + ref_size)?;
-    Some(count.iter().fold(0, |n, &byte| n << 8 | byte as u64))
-}
-
-/// Where BocReader keeps the cells it has built: by position, which it needs to resolve
-/// references, and by hash, which the rebuild needs.
-struct Cells {
-    by_index: Vec<Option<Cell>>,
-    by_hash: Known,
-    progress: Arc<Progress>,
-}
-
-struct SharedCells(Rc<RefCell<Cells>>);
-
-impl DoneCellsStorage for SharedCells {
-    fn insert(&mut self, index: u32, cell: Cell) -> Result<()> {
-        let mut cells = self.0.borrow_mut();
-        let index = index as usize;
-        if cells.by_index.len() <= index {
-            cells.by_index.resize(index + 1, None);
-        }
-        cells.by_hash.insert(cell.repr_hash(), cell.clone());
-        cells.by_index[index] = Some(cell);
-        cells.progress.add(1);
-        Ok(())
-    }
-
-    fn get(&self, index: u32) -> Result<Cell> {
-        let cells = self.0.borrow();
-        let cell = cells.by_index.get(index as usize).cloned().flatten();
-        cell.with_context(|| format!("cell #{index} of the persistent state is missing"))
-    }
-
-    fn cleanup(&mut self) -> Result<()> {
-        self.0.borrow_mut().by_index = Vec::new();
-        Ok(())
-    }
-}
-
-/// Builds the state under `root` in memory. Cells found in `known` are used as they are; every
-/// other cell is read from the database, `threads` at a time, rebuilt and checked against its hash.
-/// `progress` counts the cells read from the database.
-pub fn rebuild(root: &Cell, known: &Known, threads: usize, progress: &Progress) -> Result<Cell> {
-    if let Some(cell) = known.get(&root.repr_hash()) {
-        return Ok(cell.clone());
-    }
-    let threads = threads.max(1);
-    let built = DashMap::new();
-
-    // Read the top of the tree level by level, until it splits into enough subtrees to share out.
-    let mut top: Known = HashMap::new();
-    top.insert(root.repr_hash(), root.clone());
-    let mut level = vec![root.clone()];
-    while !level.is_empty() && level.len() < threads * TASKS_PER_THREAD {
-        let mut wanted = Vec::new();
-        let mut queued = HashSet::new();
-        for cell in &level {
+    let first = cells.len() as u32;
+    let found: DashMap<UInt256, u32> = DashMap::new();
+    found.insert(root.repr_hash(), first);
+    let next = AtomicU32::new(first + 1);
+    // Reads the children of the cells of `part` that are new, and keeps each cell's bytes.
+    let read_part = |part: &[(u32, Cell)]| -> Result<(Numbered<DbCell>, Numbered<Cell>)> {
+        let mut done = Vec::with_capacity(part.len());
+        let mut children = Vec::new();
+        for (id, cell) in part {
+            let mut refs = Refs::default();
             for i in 0..cell.references_count() {
                 let hash = cell.reference_repr_hash(i)?;
-                if !known.contains_key(&hash) && !top.contains_key(&hash) && queued.insert(hash) {
-                    wanted.push((cell, i));
-                }
-            }
-        }
-        level = read_children(&wanted, threads, progress)?;
-        for cell in &level {
-            top.insert(cell.repr_hash(), cell.clone());
-        }
-    }
-
-    // Each remaining subtree is read and built by one thread.
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads.min(level.len()))
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut pending = HashMap::new();
-                    while let Some(task) = level.get(next.fetch_add(1, Relaxed)) {
-                        if failed.load(Relaxed) {
-                            break;
-                        }
-                        let result = build_subtree(task, known, &built, &mut pending, Some(&top), progress);
-                        if result.is_err() {
-                            failed.store(true, Relaxed);
-                            return result;
-                        }
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-        workers.into_iter().try_for_each(|worker| worker.join().map_err(|_| anyhow!("a reading thread panicked"))?)
-    })?;
-
-    // Then the top of the tree, from the cells read above.
-    build_subtree(root, known, &built, &mut top, None, progress)?;
-    let rebuilt = built.get(&root.repr_hash()).map(|cell| cell.clone());
-    rebuilt.context("the state was not rebuilt")
-}
-
-/// Reads the given children from the database, `threads` at a time.
-fn read_children(wanted: &[(&Cell, usize)], threads: usize, progress: &Progress) -> Result<Vec<Cell>> {
-    if wanted.is_empty() {
-        return Ok(Vec::new());
-    }
-    std::thread::scope(|scope| {
-        let parts: Vec<_> = wanted
-            .chunks(wanted.len().div_ceil(threads))
-            .map(|part| {
-                scope.spawn(move || {
-                    let read = |&(parent, i): &(&Cell, usize)| -> Result<Cell> {
-                        let child = parent.reference(i)?;
-                        progress.add(1);
-                        Ok(child)
-                    };
-                    part.iter().map(read).collect::<Result<Vec<_>>>()
-                })
-            })
-            .collect();
-        let mut children = Vec::with_capacity(wanted.len());
-        for part in parts {
-            children.extend(part.join().map_err(|_| anyhow!("a reading thread panicked"))??);
-        }
-        Ok(children)
-    })
-}
-
-/// Builds `top` and every cell under it that is neither known nor built yet, children first.
-/// Cells already read from the database are taken from `pending` (this thread's) or `read` (shared);
-/// the rest are read here.
-fn build_subtree(
-    top: &Cell,
-    known: &Known,
-    built: &DashMap<UInt256, Cell>,
-    pending: &mut Known,
-    read: Option<&Known>,
-    progress: &Progress,
-) -> Result<()> {
-    enum Step {
-        Enter(Cell),
-        Build(Cell),
-    }
-    let mut steps = vec![Step::Enter(top.clone())];
-    while let Some(step) = steps.pop() {
-        match step {
-            Step::Enter(cell) => {
-                if built.contains_key(&cell.repr_hash()) {
-                    continue;
-                }
-                steps.push(Step::Build(cell.clone()));
-                for i in 0..cell.references_count() {
-                    let hash = cell.reference_repr_hash(i)?;
-                    if known.contains_key(&hash) || built.contains_key(&hash) {
-                        continue;
-                    }
-                    let child = match pending.get(&hash).or_else(|| read?.get(&hash)) {
-                        Some(child) => child.clone(),
-                        None => {
-                            let child = cell.reference(i)?;
+                let child = match cells.find(&hash) {
+                    Some(child) => child,
+                    None => {
+                        let mut new = false;
+                        let child = *found.entry(hash).or_insert_with(|| {
+                            new = true;
+                            next.fetch_add(1, Relaxed)
+                        });
+                        if new {
+                            children.push((child, cell.reference(i)?));
                             progress.add(1);
-                            pending.insert(hash, child.clone());
-                            child
                         }
-                    };
-                    steps.push(Step::Enter(child));
-                }
+                        child
+                    }
+                };
+                refs.push(child);
             }
-            Step::Build(cell) => {
-                let hash = cell.repr_hash();
-                if built.contains_key(&hash) {
-                    continue;
-                }
-                let mut children = Vec::with_capacity(cell.references_count());
-                for i in 0..cell.references_count() {
-                    let child_hash = cell.reference_repr_hash(i)?;
-                    let child = match known.get(&child_hash) {
-                        Some(child) => child.clone(),
-                        None => built.get(&child_hash).map(|child| child.clone()).context("a child is missing")?,
-                    };
-                    children.push(child);
-                }
-                let data = cell.raw_data()?.to_vec();
-                let rebuilt = Cell::with_cell_impl(DataCell::with_raw_data(children, data, Some(MAX_SAFE_DEPTH))?);
-                if rebuilt.repr_hash() != hash {
-                    bail!(
-                        "cell {hash:x} read from the database hashes to {:x}: the database is damaged",
-                        rebuilt.repr_hash()
-                    );
-                }
-                built.insert(hash.clone(), rebuilt);
-                pending.remove(&hash);
-            }
+            done.push((*id, DbCell { raw: cell.raw_data()?.to_vec(), refs, hash: cell.repr_hash() }));
+        }
+        Ok((done, children))
+    };
+
+    let mut read = Vec::new();
+    let mut level = vec![(first, root.clone())];
+    while !level.is_empty() {
+        let parts = std::thread::scope(|scope| {
+            let workers: Vec<_> = level
+                .chunks(level.len().div_ceil(threads.max(1)))
+                .map(|part| scope.spawn(|| read_part(part)))
+                .collect();
+            let panicked = || anyhow!("a reading thread panicked");
+            workers.into_iter().map(|part| part.join().map_err(|_| panicked())?).collect::<Result<Vec<_>>>()
+        })?;
+        level = Vec::new();
+        for (done, children) in parts {
+            read.extend(done);
+            level.extend(children);
         }
     }
-    Ok(())
-}
-
-/// Serializes a state that is in memory, the same bytes as `write_boc`. `cells` is about how many
-/// cells the state has, for the progress lines.
-pub fn serialize(root: &Cell, cells: u64, name: &str) -> Result<Vec<u8>> {
-    // BocWriter calls its abort check about three times per cell: twice while it puts the cells in
-    // order, once while it writes them out.
-    let progress = Progress::new(format!("writing {name}"), Unit::Steps, Some(3 * cells)).estimated();
-    let abort = || {
-        progress.add(1);
-        false
-    };
-    let cells = SimpleOrderedCellsStorage::default();
-    let writer = BocWriter::with_params([root.clone()], MAX_SAFE_DEPTH, cells, &abort)?;
-    let mut boc = Vec::with_capacity(writer.data_size() + 4 * writer.references_count() + 64);
-    writer.write(&mut boc)?;
-    progress.finish();
-    Ok(boc)
+    read.sort_unstable_by_key(|(id, _)| *id);
+    ensure!(read.len() as u32 == next.load(Relaxed) - first, "a cell was not read");
+    Ok((first, read.into_iter().map(|(_, cell)| cell).collect()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ever_block::{write_boc, BuilderData, HashmapE, HashmapType, IBitstring, SliceData};
+    use crate::{
+        boc::{self, BocFile},
+        progress::Unit,
+    };
+    use ever_block::{
+        create_big_cell, write_boc, BuilderData, CellImpl, CellType, DataCell, HashmapE, HashmapType, IBitstring,
+        LevelMask, MerkleProof, Serializable, SliceData,
+    };
+    use std::collections::HashSet;
 
     /// A dictionary with `n` entries, plus a cell that holds it twice and one of its values
     /// directly, so cells are shared at different depths.
@@ -302,58 +130,151 @@ mod tests {
         root.into_cell().unwrap()
     }
 
-    fn all_cells(root: &Cell) -> Known {
-        let mut cells = Known::new();
+    /// A cell with 3 bits of data, so its last byte is partly filled, that stores its own hash.
+    fn stores_its_hash() -> Cell {
+        let mut cell = BuilderData::new();
+        cell.append_bits(0b101, 3).unwrap();
+        let cell = cell.into_cell().unwrap();
+        let mut raw = cell.raw_data().unwrap().to_vec();
+        raw[0] |= 16;
+        raw.splice(2..2, cell.repr_hash().as_slice().iter().copied().chain(cell.repr_depth().to_be_bytes()));
+        Cell::with_cell_impl(DataCell::with_raw_data(vec![], raw, None).unwrap())
+    }
+
+    /// `state(n)` with the cells the export handles besides ordinary ones: a Merkle proof with pruned
+    /// branches (cells whose level isn't 0), a big cell and a cell that stores its hash.
+    fn exotic_state(n: u32) -> Cell {
+        let base = state(n);
+        let keep: HashSet<UInt256> = [base.repr_hash(), base.reference(0).unwrap().repr_hash()].into();
+        let proof = MerkleProof::create(&base, |hash| keep.contains(hash)).unwrap().serialize().unwrap();
+        let big = create_big_cell(&vec![0x5a; 3000]).unwrap();
+        let mut root = BuilderData::new();
+        root.append_u32(n).unwrap();
+        for cell in [proof, big, stores_its_hash(), base] {
+            root.checked_append_reference(cell).unwrap();
+        }
+        root.into_cell().unwrap()
+    }
+
+    fn all_cells(root: &Cell) -> HashSet<UInt256> {
+        let mut seen = HashSet::new();
         let mut stack = vec![root.clone()];
         while let Some(cell) = stack.pop() {
-            if cells.insert(cell.repr_hash(), cell.clone()).is_none() {
+            if seen.insert(cell.repr_hash()) {
                 stack.extend((0..cell.references_count()).map(|i| cell.reference(i).unwrap()));
             }
         }
-        cells
+        seen
     }
 
-    fn check(root: &Cell, known: &Known, threads: usize) -> u64 {
+    fn hashed(root: &Cell) -> HashedBoc {
+        let progress = Progress::new("hashing", Unit::Cells, None);
+        HashedBoc::new(BocFile::parse(write_boc(root).unwrap()).unwrap(), 3, &progress).unwrap()
+    }
+
+    /// Exports `root` with the cells of `base` known and the rest read from `root`'s own cells,
+    /// standing in for the database. Checks that the file is the one `write_boc` writes and returns
+    /// how many cells were read.
+    fn export(root: &Cell, base: Option<&Cell>, threads: usize) -> u64 {
         let progress = Progress::new("reading", Unit::Cells, None);
-        let rebuilt = rebuild(root, known, threads, &progress).unwrap();
-        assert_eq!(rebuilt.repr_hash(), root.repr_hash());
-        assert_eq!(write_boc(&rebuilt).unwrap(), write_boc(root).unwrap());
-        assert_eq!(serialize(&rebuilt, 100, "test").unwrap(), write_boc(root).unwrap());
+        let bases = base.map(hashed).into_iter().collect();
+        let (cells, id) = rebuild(root, bases, threads, &progress).unwrap();
+        let mut file = Vec::new();
+        boc::write(&cells, id, &mut file, "test").unwrap();
+        assert!(file == write_boc(root).unwrap(), "the file differs from write_boc's");
         progress.done()
     }
 
     #[test]
     fn rebuilds_a_state_from_scratch() {
-        let root = state(3000);
-        let cells = all_cells(&root).len() as u64;
-        // One thread reads every cell but the root exactly once. More threads can now and then
-        // read a shared cell twice, when two of them reach it before either has built it.
-        assert_eq!(check(&root, &Known::new(), 1), cells - 1);
-        for threads in [3, 16] {
-            assert!(check(&root, &Known::new(), threads) >= cells - 1);
+        for root in [state(3000), exotic_state(300)] {
+            for threads in [1, 3, 16] {
+                // every cell but the root, which the caller has, is read exactly once
+                assert_eq!(export(&root, None, threads), all_cells(&root).len() as u64 - 1);
+            }
         }
     }
 
     #[test]
     fn reads_only_what_the_persistent_state_lacks() {
-        let old = state(3000);
-        let new = state(3100);
-        let known = all_cells(&old);
-        let missing = all_cells(&new).keys().filter(|hash| !known.contains_key(*hash)).count() as u64;
-        assert!(missing < 1000, "{missing}");
-        assert_eq!(check(&new, &known, 1), missing - 1);
-        assert!(check(&new, &known, 4) >= missing - 1);
-        // the same state as the persistent one needs nothing from the database
-        assert_eq!(check(&old, &known, 4), 0);
+        for (old, new) in [(state(3000), state(3100)), (exotic_state(300), exotic_state(310))] {
+            let known = all_cells(&old);
+            let mut missing = HashSet::new();
+            let mut stack = vec![new.clone()];
+            while let Some(cell) = stack.pop() {
+                if !known.contains(&cell.repr_hash()) && missing.insert(cell.repr_hash()) {
+                    stack.extend((0..cell.references_count()).map(|i| cell.reference(i).unwrap()));
+                }
+            }
+            assert!(missing.len() < all_cells(&new).len() / 2, "{missing:?}");
+            for threads in [1, 4] {
+                assert_eq!(export(&new, Some(&old), threads), missing.len() as u64 - 1);
+            }
+            // the same state as the persistent one needs nothing from the database
+            assert_eq!(export(&old, Some(&old), 4), 0);
+        }
     }
 
     #[test]
-    fn persistent_state_file_is_read_with_all_its_cells() {
-        let root = state(500);
-        let boc = write_boc(&root).unwrap();
-        assert_eq!(boc_cells_count(&boc), Some(all_cells(&root).len() as u64));
-        let (parsed, cells) = parse_persistent(boc).unwrap();
-        assert_eq!(parsed.repr_hash(), root.repr_hash());
-        assert_eq!(cells.len(), all_cells(&root).len());
+    fn files_hash_like_ever_block() {
+        for root in [state(500), exotic_state(200)] {
+            assert_eq!(hashed(&root).root_hash(), root.repr_hash());
+        }
+        let boc = write_boc(&state(50)).unwrap();
+        assert!(BocFile::parse(boc[..boc.len() - 1].to_vec()).is_err());
+        // a hash stored in a cell is checked
+        let mut boc = write_boc(&exotic_state(20)).unwrap();
+        let hash = stores_its_hash().repr_hash();
+        let at = boc.windows(32).position(|bytes| bytes == hash.as_slice()).unwrap();
+        boc[at] ^= 1;
+        let progress = Progress::new("hashing", Unit::Cells, None);
+        assert!(HashedBoc::new(BocFile::parse(boc).unwrap(), 2, &progress).is_err());
+    }
+
+    /// A database cell whose bytes don't match the hash the database keeps it under.
+    struct Damaged(Cell, Vec<u8>);
+
+    impl CellImpl for Damaged {
+        fn data(&self) -> &[u8] {
+            self.0.data()
+        }
+        fn raw_data(&self) -> ever_block::Result<&[u8]> {
+            Ok(&self.1)
+        }
+        fn bit_length(&self) -> usize {
+            self.0.bit_length()
+        }
+        fn references_count(&self) -> usize {
+            self.0.references_count()
+        }
+        fn reference(&self, index: usize) -> ever_block::Result<Cell> {
+            self.0.reference(index)
+        }
+        fn cell_type(&self) -> CellType {
+            self.0.cell_type()
+        }
+        fn level_mask(&self) -> LevelMask {
+            self.0.level_mask()
+        }
+        fn hash(&self, index: usize) -> UInt256 {
+            self.0.hash(index)
+        }
+        fn depth(&self, index: usize) -> u16 {
+            self.0.depth(index)
+        }
+        fn store_hashes(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn damaged_database_is_reported() {
+        let root = state(100);
+        let mut raw = root.raw_data().unwrap().to_vec();
+        *raw.last_mut().unwrap() ^= 1;
+        let damaged = Cell::with_cell_impl(Damaged(root, raw));
+        let progress = Progress::new("reading", Unit::Cells, None);
+        let error = rebuild(&damaged, Vec::new(), 2, &progress).err().unwrap();
+        assert!(format!("{error:#}").contains("the database is damaged"), "{error:#}");
     }
 }

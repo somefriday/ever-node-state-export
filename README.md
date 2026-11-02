@@ -12,8 +12,8 @@ state from these two files.
 - **Time with the node stopped.** The tool reads the node's database directly, which it can't do
   while the node runs. Each route below shows how to stop the node.
 - **Room for the result**: about the size of the node's state (several GB on mainnet).
-- **Memory.** The tool builds each state in memory before it writes it out: on mainnet that takes
-  about 65 GB of free RAM.
+- **Memory.** About twice the size of the node's masterchain state: about 15 GB of free RAM on
+  mainnet.
 
 The commands below are for root, as validator servers are usually run. As another user, put `sudo` in
 front of them, and of `docker` too unless you're in the `docker` group.
@@ -27,8 +27,9 @@ docker build --target binary --output . .
 install state-export /usr/local/bin/
 ```
 
-`state-export --version` shows which ever-node version the tool reads. The tool runs on Ubuntu 22.04
-and 24.04 and on Debian 11, 12 and 13, on x86_64 and arm64.
+`state-export --version` shows the tool's version and the ever-node version it reads, for example
+`state-export 0.2.0 (ever-node 0.60.11, commit e4068621a96d78969dd6df3087504d25b06fca6e)`. The tool
+runs on Ubuntu 22.04 and 24.04 and on Debian 11, 12 and 13, on x86_64 and arm64.
 
 For route 3, build the image too (in the same folder):
 
@@ -127,10 +128,11 @@ The tool says what it's doing, and for the long steps how far it has got and how
 
 It starts from the newest persistent state the node keeps on disk: the node saves its whole state
 every 36 hours or so. The tool reads that file in one pass and takes from the database only the cells
-that changed since, so on mainnet the export takes minutes rather than hours. A node that keeps no
-persistent states (`"skip_saving_persistent_states": true` in its config) makes the tool read every
-cell from the database instead, which takes hours on mainnet. `--threads` sets how many cells it
-reads at the same time (the default is one per CPU, and at least 16).
+that changed since, so on mainnet the export takes minutes rather than hours. Each file is read back
+and checked against the block's state hash once it is written. A node that keeps no persistent
+states (`"skip_saving_persistent_states": true` in its config) makes the tool read every cell from
+the database instead, which takes hours on mainnet. `--threads` sets how many threads read cells
+from the database and hash them (the default is one per CPU, and at least 16).
 
 If you stop an export with Ctrl-C, the database folder keeps the file `ton_node.running`, which tells
 the node it crashed. If the node had stopped cleanly before the export (its log shows `Node stopped`
@@ -179,7 +181,9 @@ It shows the database version, the node's last block and the range of blocks it 
 | Message | What to do |
 |---|---|
 | `cannot use the persistent state of ...` | The node's saved state file is damaged or incomplete. The tool goes on without it and reads every cell from the database, which takes hours on mainnet. |
+| `cannot read key block ...` | The node no longer has the key block in its archive, so the tool can't tell which basechain persistent state to start from. It goes on and reads every basechain cell from the database, which can take an hour or more on mainnet. |
 | `... read from the database hashes to ...: the database is damaged` | The node's database is damaged. Use another node. |
+| `... was written wrong` | The file read back from the disk differs from what the tool wrote. Check the disk and export again. |
 
 ### About the block
 

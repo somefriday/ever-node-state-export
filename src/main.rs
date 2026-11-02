@@ -2,17 +2,19 @@
 //! the state of the basechain block that masterchain block lists as latest. The two files are the
 //! inputs of tycho-state-updater. `verify` checks such files against a node's own database.
 //!
-//! Each state is built in memory from the newest persistent state the node keeps on disk, plus the
-//! cells that changed since, which come from the database.
+//! Each state is rebuilt from the newest persistent state the node keeps on disk, plus the cells
+//! that changed since, which come from the database.
 
+mod boc;
+mod cells;
 mod progress;
 mod rebuild;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use ever_block::{
-    read_single_root_boc, BlockIdExt, Cell, Deserializable, HashmapAugType, ShardStateUnsplit,
-};
+use boc::BocFile;
+use cells::HashedBoc;
+use ever_block::{read_single_root_boc, BlockIdExt, Deserializable, HashmapAugType, ShardStateUnsplit};
 use ever_node::{
     collator_test_bundle::{create_engine_allocated, create_engine_telemetry},
     internal_db::{
@@ -21,7 +23,6 @@ use ever_node::{
     shard_state::ShardStateStuff,
 };
 use progress::{Progress, Unit};
-use rebuild::Known;
 use serde_json::json;
 use std::{
     os::unix::fs::MetadataExt,
@@ -82,7 +83,7 @@ struct ExportArgs {
     /// Export block N even if it is a key block (for tests only)
     #[arg(long)]
     allow_key_block: bool,
-    /// How many cells to read from the database at the same time [default: one per CPU, at least 16]
+    /// How many threads read cells from the database and hash them [default: one per CPU, at least 16]
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
     threads: Option<u16>,
 }
@@ -393,44 +394,37 @@ async fn export(args: ExportArgs) -> Result<()> {
     let snapshot = load_snapshot(&db, args.mc_seqno, !args.allow_key_block)?;
     let Snapshot { mc_id, key_block, mc_state, shard_id, shard_state } = snapshot;
     let threads = args.threads.map_or_else(default_threads, usize::from);
-    let write = |name: &str, data: &[u8]| {
-        let path = out.join(name);
-        std::fs::write(&path, data).with_context(|| format!("cannot write {}", path.display()))
-    };
 
     eprintln!("masterchain block {}", mc_id.seq_no());
     let base = persistent_base(&db, &mc_state, &mc_id).await?;
-    if base.is_none() {
-        eprintln!("  no persistent state at or before this block is on disk");
-    }
-    let mut known = Known::new();
+    let mut bases = Vec::new();
     let mut shard_bases = Vec::new();
-    if let Some(base) = &base {
-        if let Some(root) = load_persistent(&db, base, &mut known, &format!("key block {}", base.seq_no())).await {
-            let (telemetry, allocated) = (create_engine_telemetry(), create_engine_allocated());
-            let state = ShardStateStuff::from_state_root_cell(base.clone(), root, &telemetry, &allocated)?;
-            shard_bases = state.top_blocks_all()?;
+    match &base {
+        Some(base) => {
+            bases.extend(load_persistent(&db, base, &format!("key block {}", base.seq_no()), threads).await);
+            shard_bases = listed_blocks(&db, base).await;
         }
+        None => eprintln!("  no persistent state at or before this block is on disk"),
     }
     let base_name = base.as_ref().map(|base| format!("key block {}", base.seq_no()));
-    let since = base_name.as_deref().filter(|_| !known.is_empty());
-    let (mc_root, cells) = build_state(&mc_state, known, since, threads)?;
-    write("masterstate.boc", &rebuild::serialize(&mc_root, cells, "masterstate.boc")?)?;
-    drop(mc_root);
+    let since = base_name.as_deref().filter(|_| !bases.is_empty());
+    export_state(&mc_state, bases, since, threads, &out.join("masterstate.boc"))?;
 
     eprintln!("basechain block {}", shard_id.seq_no());
-    let mut known = Known::new();
+    let mut bases = Vec::new();
     for id in shard_bases.iter().filter(|id| id.shard().workchain_id() == 0) {
         let what = format!("basechain block {}", id.seq_no());
         if has_persistent_state(&db, id).await {
-            load_persistent(&db, id, &mut known, &what).await;
+            bases.extend(load_persistent(&db, id, &what, threads).await);
         } else {
             eprintln!("  the persistent state of {what} is not on disk");
         }
     }
-    let since = base_name.as_deref().filter(|_| !known.is_empty());
-    let (shard_root, cells) = build_state(&shard_state, known, since, threads)?;
-    write("shardstate.boc", &rebuild::serialize(&shard_root, cells, "shardstate.boc")?)?;
+    let since = base_name.as_deref().filter(|_| !bases.is_empty());
+    let shard_path = out.join("shardstate.boc");
+    export_state(&shard_state, bases, since, threads, &shard_path)?;
+    // The manifest counts the accounts of the basechain state, read back from its file.
+    let shard_root = read_single_root_boc(std::fs::read(&shard_path)?)?;
     let mut accounts = 0u64;
     ShardStateUnsplit::construct_from_cell(shard_root)?.read_accounts()?.iterate_objects(|_| {
         accounts += 1;
@@ -457,7 +451,9 @@ async fn export(args: ExportArgs) -> Result<()> {
         },
         "exporter": VERSION,
     });
-    write("manifest.json", &serde_json::to_vec_pretty(&manifest)?)?;
+    let manifest_path = out.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+        .with_context(|| format!("cannot write {}", manifest_path.display()))?;
 
     println!("masterchain block {} -> masterstate.boc", mc_id.seq_no());
     println!("basechain block {} -> shardstate.boc", shard_id.seq_no());
@@ -501,12 +497,24 @@ async fn has_persistent_state(db: &InternalDb, id: &BlockIdExt) -> bool {
     saved && db.load_shard_state_persistent_size(id).await.is_ok()
 }
 
-/// Reads the persistent state of `id` in one pass and adds its cells to `known`. Returns the
-/// state's root, or None when the file can't be used; the export then reads those cells from the
-/// database instead.
-async fn load_persistent(db: &InternalDb, id: &BlockIdExt, known: &mut Known, what: &str) -> Option<Cell> {
+/// The blocks a key block lists as the latest of each shard, read from the block itself.
+async fn listed_blocks(db: &InternalDb, id: &BlockIdExt) -> Vec<BlockIdExt> {
+    let result = async {
+        let handle = db.load_block_handle(id)?.context("the database has no record of it")?;
+        db.load_block_data(&handle).await?.top_blocks_all()
+    }
+    .await;
+    result.unwrap_or_else(|error| {
+        eprintln!("  cannot read key block {}: {error:#}", id.seq_no());
+        Vec::new()
+    })
+}
+
+/// Reads the persistent state of `id` in one pass and hashes its cells. Returns None when the file
+/// can't be used; the export then reads those cells from the database instead.
+async fn load_persistent(db: &InternalDb, id: &BlockIdExt, what: &str, threads: usize) -> Option<HashedBoc> {
     const PART: u64 = 64 << 20;
-    let result: Result<Cell> = async {
+    let result: Result<HashedBoc> = async {
         let size = db.load_shard_state_persistent_size(id).await?;
         eprintln!("  base: the persistent state of {what}, {}", progress::bytes(size));
         let progress = Progress::new("reading it", Unit::Bytes, Some(size));
@@ -520,13 +528,15 @@ async fn load_persistent(db: &InternalDb, id: &BlockIdExt, known: &mut Known, wh
             data.extend_from_slice(&part);
         }
         progress.finish();
-        let (root, cells) = rebuild::parse_persistent(data)?;
-        known.extend(cells);
-        Ok(root)
+        let file = BocFile::parse(data)?;
+        let progress = Progress::new("hashing its cells", Unit::Cells, Some(file.cells() as u64));
+        let hashed = HashedBoc::new(file, threads, &progress)?;
+        progress.finish();
+        Ok(hashed)
     }
     .await;
     match result {
-        Ok(root) => Some(root),
+        Ok(hashed) => Some(hashed),
         Err(error) => {
             eprintln!("  cannot use the persistent state of {what}: {error:#}");
             None
@@ -534,10 +544,16 @@ async fn load_persistent(db: &InternalDb, id: &BlockIdExt, known: &mut Known, wh
     }
 }
 
-/// Builds a state in memory: the cells in `known` (a persistent state) are used as they are, the
-/// rest come from the database. `since` names the persistent state. Returns the state and about how
-/// many cells it has.
-fn build_state(state: &ShardStateStuff, known: Known, since: Option<&str>, threads: usize) -> Result<(Cell, u64)> {
+/// Builds a state from the cells of `bases` (persistent states) and the rest from the database, and
+/// writes it to `path`. `since` names the persistent state. The file is then read back and hashed:
+/// a mistake in writing it would change its root hash.
+fn export_state(
+    state: &ShardStateStuff,
+    bases: Vec<HashedBoc>,
+    since: Option<&str>,
+    threads: usize,
+    path: &Path,
+) -> Result<()> {
     let root = state.root_cell();
     let progress = match since {
         Some(since) => {
@@ -549,9 +565,19 @@ fn build_state(state: &ShardStateStuff, known: Known, since: Option<&str>, threa
             Progress::new("reading cells from the database", Unit::Cells, Some(root.tree_cell_count())).estimated()
         }
     };
-    let rebuilt = rebuild::rebuild(root, &known, threads, &progress)?;
+    let (cells, id) = rebuild::rebuild(root, bases, threads, &progress)?;
     progress.finish();
-    Ok((rebuilt, known.len() as u64 + progress.done()))
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let file = std::fs::File::create(path).with_context(|| format!("cannot write {}", path.display()))?;
+    boc::write(&cells, id, file, &name).with_context(|| format!("cannot write {}", path.display()))?;
+    drop(cells);
+
+    let file = BocFile::parse(std::fs::read(path)?)?;
+    let progress = Progress::new(format!("checking {name}"), Unit::Cells, Some(file.cells() as u64));
+    let written = HashedBoc::new(file, threads, &progress)?.root_hash();
+    progress.finish();
+    ensure!(written == root.repr_hash(), "{name} was written wrong: its root hash is {written:x}");
+    Ok(())
 }
 
 async fn verify(args: VerifyArgs) -> Result<()> {
@@ -567,9 +593,13 @@ async fn verify(args: VerifyArgs) -> Result<()> {
     let mut all_match = true;
     for (chain, file, block, expected) in checks {
         let data = std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))?;
-        let actual = read_single_root_boc(&data)
+        // Hashing the file's cells without building them takes seconds and little memory even for
+        // a mainnet state.
+        let progress = Progress::new(format!("checking {}", file.display()), Unit::Cells, None);
+        let actual = BocFile::parse(data)
+            .and_then(|cells| HashedBoc::new(cells, default_threads(), &progress))
             .with_context(|| format!("{} is not a state file", file.display()))?
-            .repr_hash();
+            .root_hash();
         if actual == expected {
             println!("{chain}: {} matches block {}", file.display(), block.seq_no());
         } else {
