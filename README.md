@@ -28,7 +28,7 @@ install state-export /usr/local/bin/
 ```
 
 `state-export --version` shows the tool's version and the ever-node version it reads, for example
-`state-export 0.2.0 (ever-node 0.60.11, commit e4068621a96d78969dd6df3087504d25b06fca6e)`. The tool
+`state-export 0.3.0 (ever-node 0.60.11, commit e4068621a96d78969dd6df3087504d25b06fca6e)`. The tool
 runs on Ubuntu 22.04 and 24.04 and on Debian 11, 12 and 13, on x86_64 and arm64.
 
 For route 3, build the image too (in the same folder):
@@ -124,7 +124,21 @@ path as the container sees it (its `internal_db_path`).
 
 ### While it runs
 
-The tool says what it's doing, and for the long steps how far it has got and how long is left.
+The tool says what it's doing. Each step is numbered, so you can see how far through the export it
+is, and shows a progress bar with the time left, for example:
+
+```
+masterchain block 63388016
+  [1/11] reading the persistent state of key block 63075727
+    [####################] 100%  6.70 GB in 16 s
+  [2/11] hashing its cells
+    [#########-----------]  45%  about 12 s left, 56,771,436 of 126,158,747 cells, 6,301,270/s
+```
+
+Reading the cells that changed from the database shows how many it has read so far: how many there
+are isn't known in advance. In a terminal the progress line is redrawn in place; when the output goes
+to a file or through `tee`, a new line is added every 10 seconds. The first line, `opening the
+database`, has no progress line.
 
 It starts from the newest persistent state the node keeps on disk: the node saves its whole state
 every 36 hours or so. The tool reads that file in one pass and takes from the database only the cells

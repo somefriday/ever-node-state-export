@@ -173,8 +173,9 @@ fn order(cells: &Cells, root: u32) -> Vec<u32> {
     left
 }
 
-/// Writes the state under `root` byte for byte as ever-block's `write_boc` would.
-pub fn write(cells: &Cells, root: u32, out: impl Write, name: &str) -> Result<()> {
+/// Writes the state under `root` byte for byte as ever-block's `write_boc` would. `what` names the
+/// step for its progress line.
+pub fn write(cells: &Cells, root: u32, out: impl Write, what: &str) -> Result<()> {
     let depth = cells.depth(root);
     ensure!(depth <= MAX_SAFE_DEPTH, "the state is too deep: {depth} > {MAX_SAFE_DEPTH}");
     let order = order(cells, root);
@@ -195,7 +196,7 @@ pub fn write(cells: &Cells, root: u32, out: impl Write, name: &str) -> Result<()
     let size = data_size + references * ref_size;
     let offset_size = bytes_for(size);
 
-    let progress = Progress::new(format!("writing {name}"), Unit::Cells, Some(order.len() as u64));
+    let progress = Progress::new(what, Unit::Cells, Some(order.len() as u64));
     let mut out = std::io::BufWriter::with_capacity(8 << 20, out);
     out.write_all(if big_cells > 0 { &TAG_BIG_CELLS } else { &TAG })?;
     out.write_all(&[ref_size as u8, offset_size as u8])?;
