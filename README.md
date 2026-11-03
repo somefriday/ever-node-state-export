@@ -5,16 +5,13 @@ plus the state of the basechain block it points to. `tycho-state-updater` builds
 state from these two files.
 
 
-## Before you start
+## To start you need
 
 - **The block number `N`.** The coordinator announces it.
-- **Docker** to build the tool, on the node's server or another machine (building without Docker
-  works too).
-- **Time with the node stopped.** The tool reads the node's database directly, which it can't do
-  while the node runs. Each route below shows how to stop the node.
-- **Room for the result**: about the size of the node's state (several GB on mainnet).
-- **Memory.** About twice the size of the node's masterchain state: about 15 GB of free RAM on
-  mainnet.
+- **Synced node.** Node that you are ready to stop. You can prepare a new one with [evernode cli](https://github.com/somefriday/evernode_cli)
+- **Right time to stop the node.** Node should be stopped after round starts, at least two blocks ahead the end of elections. Align stop with required mc seq_no
+- **Storage**: SDD with about 30 GB of free space
+- **Memory.** about 16 GB of free RAM
 
 The commands below are for root, as validator servers are usually run. As another user, put `sudo` in
 front of them, and of `docker` too unless you're in the `docker` group.
@@ -56,7 +53,7 @@ docker stop --time 30 <container_name>
 evernode node stop -n <name> --force
 ```
 
-wait until node is fulli stopped.
+wait until node is fully stopped.
 
 ----
 
