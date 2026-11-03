@@ -69,18 +69,18 @@ state-export info --db <rocksdb_folder>
 
 #### For evernode cli provisioned node:
 ```sh
-state-export info --evernode validator02
+state-export info --evernode <node_name>
 ```
 
 #### Output example:
 ```sh
-state-export info --evernode validator02
+state-export info --evernode <node_name>
 database folder: /var/lib/ever-validator/nodes/validator02/node_db
 database version: 6 (this build reads version 6)
 this build: 0.3.1 (ever-node 0.60.11, commit e4068621a96d78969dd6df3087504d25b06fca6e)
-last applied masterchain block: 63402596 (time 1793648718)
+last applied masterchain block: <mc_seq_no> (time 1793648718)
 basechain blocks applied up to masterchain block 63402595
-newest saved masterchain state: block <S>
+newest saved masterchain state: block <mc_seq_no>
 blocks that can be exported: <oldest> to <newest>
 ```
 
@@ -103,7 +103,7 @@ The database folder is the one named by `internal_db_path` in the node's `config
 
 ### For evernode cli provisioned node:
 ```sh
-state-export export --evernode <name> --mc-seqno <N> --out ./export
+state-export export --evernode <node_name> --mc-seqno <N> --out ./export
 ```
 The tool finds the node's database and checks that the node runs the ever-node commit the tool was
 built for. If evernode_cli keeps its data somewhere other than `/var/lib/ever-validator`, add
