@@ -10,7 +10,7 @@ state from these two files.
 - **The block number `N`.** The coordinator announces it.
 - **Synced node.** Node that you are ready to stop. You can prepare a new one with [evernode cli](https://github.com/somefriday/evernode_cli)
 - **Right time to stop the node.** Node should be stopped after round starts, at least two blocks ahead the end of elections. Align stop with required mc seq_no
-- **Storage**: SDD with about 30 GB of free space
+- **Storage**: SDD with at least 300 GB of free space (running ever-node + two dump states)
 - **Memory.** about 16 GB of free RAM
 
 The commands below are for root, as validator servers are usually run. As another user, put `sudo` in
